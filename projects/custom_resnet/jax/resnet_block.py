@@ -253,20 +253,36 @@ def resnet_block_forward(params, x, is_training=True):
     return out, updated_params
 
 if __name__ == "__main__":
-    # Example usage / Testing block
-    key = jax.random.PRNGKey(0)
+    # ── Master PRNG key ──────────────────────────────────────────────
+    # Every random operation receives its own unique subkey via
+    # jax.random.split so that no key is ever reused.
+    master_key = jax.random.PRNGKey(0)
+
     batch_size = 4
     in_channels = 16
     out_channels = 32
     height, width = 32, 32
-    
-    x = jax.random.normal(key, (batch_size, height, width, in_channels))
-    
+    num_iterations = 3  # number of simulated training iterations
+
+    # ── Split: one key for parameter init, one for the iteration loop ─
+    init_key, loop_key = jax.random.split(master_key)
+
     print("Initializing parameters...")
-    params = init_resnet_block_params(key, in_channels, out_channels, stride=2)
-    
-    print("Running forward pass...")
-    out, updated_params = resnet_block_forward(params, x, is_training=True)
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {out.shape}")
-    print("Success!")
+    params = init_resnet_block_params(init_key, in_channels, out_channels, stride=2)
+
+    # ── Explicit iteration loop with proper key threading ────────────
+    for step in range(num_iterations):
+        # Split the loop key *before* each iteration:
+        #   • loop_key is advanced for the next iteration
+        #   • step_key is consumed for this iteration's random data
+        loop_key, step_key = jax.random.split(loop_key)
+
+        # Generate a fresh random batch for this iteration
+        x = jax.random.normal(step_key, (batch_size, height, width, in_channels))
+
+        print(f"\n── Iteration {step} ──")
+        out, params = resnet_block_forward(params, x, is_training=True)
+        print(f"  Input shape:  {x.shape}")
+        print(f"  Output shape: {out.shape}")
+
+    print("\nAll iterations completed successfully!")
