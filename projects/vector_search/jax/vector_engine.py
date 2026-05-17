@@ -1,6 +1,8 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh, PartitionSpec as P
 
 def l2_distance(queries: jax.Array, database: jax.Array) -> jax.Array:
     """
@@ -126,3 +128,129 @@ def vector_search(queries: jax.Array, database: jax.Array, k: int, metric: str =
         top_k_dists = top_k_scores
         
     return top_k_dists, top_k_indices
+
+@partial(jax.jit, static_argnames=['k', 'metric'])
+def distributed_vector_search(mesh: Mesh, queries: jax.Array, database: jax.Array, k: int, metric: str = 'l2'):
+    """
+    Finds the top-K nearest neighbors using manual distributed SPMD compute.
+    
+    This function explicitly maps local search operations across the given device mesh using `jax.shard_map`.
+    
+    Args:
+        mesh: The device Mesh to shard across.
+        queries: Array of shape (B, D). Must be perfectly replicated across the mesh.
+        database: Array of shape (N, D). Must be sharded along its first dimension (rows).
+        k: The number of nearest neighbors to retrieve.
+        metric: The distance metric to use ('l2', 'cosine', or 'dot_product').
+        
+    Returns:
+        distances: Array of shape (B, k) containing distances.
+        indices: Array of shape (B, k) containing global indices of the top-k vectors.
+    """
+    
+    def local_search(local_queries, local_db):
+        # 1. Local Distances Calculation
+        if metric == 'l2':
+            dists = l2_distance(local_queries, local_db)
+            scores = -dists
+        elif metric == 'cosine':
+            dists = cosine_distance(local_queries, local_db)
+            scores = -dists
+        elif metric == 'dot_product':
+            dists = dot_product_distance(local_queries, local_db)
+            scores = dists
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+        
+        # 2. Local top-K
+        local_top_scores, local_top_indices = jax.lax.top_k(scores, k)
+        
+        # 3. Apply global index offset
+        # Find which shard we are on (device index)
+        device_id = jax.lax.axis_index('data')
+        
+        # Determine the number of local rows to offset the indices
+        # local_db.shape[0] gives the size of the database chunk residing on this specific device.
+        # e.g., if total DB is 8000 and we have 8 devices:
+        # local_db_size = 1000
+        local_db_size = local_db.shape[0]
+        
+        # We need to map the local indices (which range from 0 to 999) back to their 
+        # original global indices (which range from 0 to 7999).
+        # e.g., device 0 has indices 0-999 (offset = 0 * 1000 = 0)
+        #       device 1 has indices 1000-1999 (offset = 1 * 1000 = 1000)
+        global_indices = local_top_indices + device_id * local_db_size
+        
+        # 4. Gather local results from all devices
+        # all_gather takes an array from each device and concatenates/stacks them along a new axis.
+        # It's a collective communication operation where every device shares its local top-K 
+        # results with every other device in the mesh.
+        #
+        # Example with num_devices=2, B=1 (1 query), k=2 (top 2):
+        # Device 0 finds local scores [[0.9, 0.8]] and global indices [[10, 20]]
+        # Device 1 finds local scores [[0.95, 0.7]] and global indices [[1015, 1025]]
+        # 
+        # all_gather stacks them so EVERY device gets the full tensor of shape (2, 1, 2):
+        # gathered_scores = jnp.array([
+        #   [[0.9, 0.8]],    # Device 0's contribution
+        #   [[0.95, 0.7]]    # Device 1's contribution
+        # ])
+        gathered_scores = jax.lax.all_gather(local_top_scores, axis_name='data')
+        gathered_indices = jax.lax.all_gather(global_indices, axis_name='data')
+        
+        return gathered_scores, gathered_indices
+
+    # Run the local_search mapping over the 'data' mesh axis
+    # jax.experimental.shard_map allows us to write Single-Program, Multiple-Data (SPMD) code.
+    # It takes the global arrays, splits them according to in_specs, runs `local_search` on 
+    # each device concurrently using only its local slice of data, and then reassembles the 
+    # results according to out_specs.
+    gathered_scores, gathered_indices = shard_map(
+        local_search,
+        mesh=mesh,
+        # in_specs: Queries are copied entirely to all devices. Database is split along axis 0.
+        in_specs=(P(None, None), P('data', None)),
+        # out_specs: The gathered outputs from local_search are replicated across all devices.
+        out_specs=(P(None, None, None), P(None, None, None))
+    )(queries, database)
+    
+    # 5. Global Reduction (Absolute Top-K)
+    # The output from shard_map is currently shaped (num_devices, B, k)
+    # We want to find the top-K across all device chunks, so we reshape to (B, num_devices * k)
+    B = queries.shape[0]
+    
+    # We swap axes so Batch is first, then reshape to flatten device and K dimensions.
+    # We want to combine the top-K candidates from all devices into a single pool for each query.
+    #
+    # Continuing our 2-device, B=1, k=2 example:
+    # gathered_scores shape: (2, 1, 2)
+    # [
+    #   [[0.9, 0.8]],  # Device 0
+    #   [[0.95, 0.7]]  # Device 1
+    # ]
+    #
+    # 1. transpose(1, 0, 2) brings Batch to the front -> shape (1, 2, 2):
+    # [
+    #   [ [0.9, 0.8], [0.95, 0.7] ]
+    # ]
+    #
+    # 2. reshape(B, -1) flattens the devices and candidates -> shape (1, 4):
+    # [[0.9, 0.8, 0.95, 0.7]]
+    #
+    # Now we have all 4 candidate scores (and indices) in a flat array, ready for a final top_k!
+    flat_gathered_scores = gathered_scores.transpose(1, 0, 2).reshape(B, -1)
+    flat_gathered_indices = gathered_indices.transpose(1, 0, 2).reshape(B, -1)
+    
+    # Run a final top-k over all the gathered local top-k candidates
+    global_top_k_scores, global_top_k_idx = jax.lax.top_k(flat_gathered_scores, k)
+    
+    # Map the relative indices from the global_top_k_idx back to the actual database global indices
+    final_indices = jnp.take_along_axis(flat_gathered_indices, global_top_k_idx, axis=-1)
+    
+    # Convert scores back to distances if necessary
+    if metric in ['l2', 'cosine']:
+        final_dists = -global_top_k_scores
+    else:
+        final_dists = global_top_k_scores
+        
+    return final_dists, final_indices

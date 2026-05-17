@@ -1,3 +1,5 @@
+import os
+os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -123,3 +125,40 @@ def test_invalid_metric():
     
     with pytest.raises(ValueError, match="Unknown metric: invalid"):
         vector_search(queries, database, k=2, metric='invalid')
+
+def test_distributed_vector_search():
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from vector_engine import distributed_vector_search
+    
+    # Verify devices
+    devices = jax.devices()
+    assert len(devices) == 8, "Expected 8 simulated CPU devices"
+    
+    # Create mesh
+    mesh = Mesh(devices, axis_names=('data',))
+    
+    # Generate random test data
+    key = jax.random.PRNGKey(42)
+    db_key, query_key = jax.random.split(key)
+    
+    N, D, B, K = 8000, 128, 32, 10
+    
+    mock_db = jax.random.normal(db_key, (N, D))
+    mock_queries = jax.random.normal(query_key, (B, D))
+    
+    # Shard database and replicate queries
+    db_sharding = NamedSharding(mesh, P('data', None))
+    query_sharding = NamedSharding(mesh, P(None, None))
+    
+    sharded_db = jax.device_put(mock_db, db_sharding)
+    sharded_queries = jax.device_put(mock_queries, query_sharding)
+    
+    # Run regular vector search (baseline)
+    expected_dists, expected_indices = vector_search(mock_queries, mock_db, k=K, metric='l2')
+    
+    # Run distributed vector search
+    dist_dists, dist_indices = distributed_vector_search(mesh, sharded_queries, sharded_db, k=K, metric='l2')
+    
+    # Assert exact match
+    np.testing.assert_allclose(dist_dists, expected_dists, atol=1e-5)
+    np.testing.assert_array_equal(dist_indices, expected_indices)
