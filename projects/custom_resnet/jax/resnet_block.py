@@ -6,6 +6,10 @@ def init_resnet_block_params(key, in_channels, out_channels, stride=1):
     Initializes the parameters for a ResNet block.
     
     In raw JAX, we keep parameters completely separate from the computation.
+    Furthermore, JAX requires strict separation between:
+      1. `params`: Differentiable weights updated by the optimizer via gradients.
+      2. `state`: Non-differentiable mutable state updated via forward pass 
+                  logic (like batch norm moving averages).
     
     Args:
         key: jax.random.PRNGKey for random initialization.
@@ -14,7 +18,8 @@ def init_resnet_block_params(key, in_channels, out_channels, stride=1):
         stride: Stride for the first convolution.
         
     Returns:
-        A dictionary containing the initialized parameters (weights, biases, batch norm stats).
+        params: Dictionary of differentiable weights/biases.
+        state: Dictionary of non-differentiable tracking metrics (BN stats).
     """
     # TODO: Implement parameter initialization. You will need:
     # 1. Conv layer 1 weights (3x3 kernel, in_channels, out_channels)
@@ -36,6 +41,9 @@ def init_resnet_block_params(key, in_channels, out_channels, stride=1):
     fan_in_2 = 3 * 3 * out_channels
     std2 = jnp.sqrt(2. / fan_in_2)
 
+    # ── 1. Differentiable Parameters (params) ────────────────────────
+    # These are the weights and biases that will receive gradients from jax.grad 
+    # and be updated by an optimizer (like Adam/SGD).
     params = {
         'conv_layer_1':{
             'weight': std1 * jax.random.normal(k1, (3, 3, in_channels, out_channels)),
@@ -44,8 +52,6 @@ def init_resnet_block_params(key, in_channels, out_channels, stride=1):
         'batch_norm_1':{
             'gamma': jnp.ones(out_channels),
             'beta': jnp.zeros(out_channels),
-            'running_mean': jnp.zeros(out_channels),
-            'running_var': jnp.ones(out_channels)
         },
         'conv_layer_2':{
             'weight': std2 * jax.random.normal(k2, (3, 3, out_channels, out_channels)),
@@ -54,10 +60,23 @@ def init_resnet_block_params(key, in_channels, out_channels, stride=1):
         'batch_norm_2':{
             'gamma': jnp.ones(out_channels),
             'beta': jnp.zeros(out_channels),
+        },
+        'stride': stride
+    }
+
+    # ── 2. Non-differentiable State (state) ──────────────────────────
+    # These are moving averages tracked over time. They DO NOT receive gradients.
+    # If we put them in `params`, jax.grad would try to differentiate them, 
+    # causing mathematical errors and wasting memory.
+    state = {
+        'batch_norm_1':{
             'running_mean': jnp.zeros(out_channels),
             'running_var': jnp.ones(out_channels)
         },
-        'stride': stride
+        'batch_norm_2':{
+            'running_mean': jnp.zeros(out_channels),
+            'running_var': jnp.ones(out_channels)
+        }
     }
 
     if in_channels != out_channels or stride != 1:
@@ -70,7 +89,7 @@ def init_resnet_block_params(key, in_channels, out_channels, stride=1):
     else:
         params['projection'] = None
         
-    return params
+    return params, state
 
 def relu(x):
     """
@@ -181,20 +200,22 @@ def batch_norm(x, gamma, beta, running_mean, running_var, is_training=True, eps=
     
     return out, new_running_mean, new_running_var
 
-def resnet_block_forward(params, x, is_training=True):
+def resnet_block_forward(params, state, x, is_training=True):
     """
     Forward pass of the ResNet Block.
     
     Args:
-        params: Dictionary of parameters from init_resnet_block_params.
+        params: Dictionary of differentiable parameters.
+        state: Dictionary of mutable state (BN running stats).
+               We pass this explicitly because JAX forbids in-place mutation.
         x: Input tensor of shape (batch_size, height, width, in_channels).
         is_training: Boolean, whether in training mode.
         
     Returns:
-        Output tensor after the ResNet block.
-        Updated parameters (since running stats for BatchNorm might change during training).
+        out: Output tensor after the ResNet block.
+        new_state: Updated dictionary of mutable state. 
+                   Must be returned so the training loop doesn't lose the updates.
     """
-    updated_params = dict(params)          # shallow copy so we can swap BN stats
     stride = params.get('stride', 1)
     identity = x
 
@@ -208,8 +229,8 @@ def resnet_block_forward(params, x, is_training=True):
         out,
         params['batch_norm_1']['gamma'],
         params['batch_norm_1']['beta'],
-        params['batch_norm_1']['running_mean'],
-        params['batch_norm_1']['running_var'],
+        state['batch_norm_1']['running_mean'],
+        state['batch_norm_1']['running_var'],
         is_training=is_training
     )
     out = relu(out)
@@ -223,8 +244,8 @@ def resnet_block_forward(params, x, is_training=True):
         out,
         params['batch_norm_2']['gamma'],
         params['batch_norm_2']['beta'],
-        params['batch_norm_2']['running_mean'],
-        params['batch_norm_2']['running_var'],
+        state['batch_norm_2']['running_mean'],
+        state['batch_norm_2']['running_var'],
         is_training=is_training
     )
 
@@ -238,19 +259,19 @@ def resnet_block_forward(params, x, is_training=True):
     # Residual add + final activation
     out = relu(out + identity)
 
-    # --- Persist updated running statistics ---
-    updated_params['batch_norm_1'] = {
-        **params['batch_norm_1'],
-        'running_mean': new_rm1,
-        'running_var': new_rv1,
-    }
-    updated_params['batch_norm_2'] = {
-        **params['batch_norm_2'],
-        'running_mean': new_rm2,
-        'running_var': new_rv2,
+    # --- Create updated state ---
+    new_state = {
+        'batch_norm_1': {
+            'running_mean': new_rm1,
+            'running_var': new_rv1,
+        },
+        'batch_norm_2': {
+            'running_mean': new_rm2,
+            'running_var': new_rv2,
+        }
     }
 
-    return out, updated_params
+    return out, new_state
 
 if __name__ == "__main__":
     # ── Master PRNG key ──────────────────────────────────────────────
@@ -267,8 +288,8 @@ if __name__ == "__main__":
     # ── Split: one key for parameter init, one for the iteration loop ─
     init_key, loop_key = jax.random.split(master_key)
 
-    print("Initializing parameters...")
-    params = init_resnet_block_params(init_key, in_channels, out_channels, stride=2)
+    print("Initializing parameters and state...")
+    params, state = init_resnet_block_params(init_key, in_channels, out_channels, stride=2)
 
     # ── Explicit iteration loop with proper key threading ────────────
     for step in range(num_iterations):
@@ -281,7 +302,7 @@ if __name__ == "__main__":
         x = jax.random.normal(step_key, (batch_size, height, width, in_channels))
 
         print(f"\n── Iteration {step} ──")
-        out, params = resnet_block_forward(params, x, is_training=True)
+        out, state = resnet_block_forward(params, state, x, is_training=True)
         print(f"  Input shape:  {x.shape}")
         print(f"  Output shape: {out.shape}")
 
