@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from functools import partial
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
@@ -129,7 +130,7 @@ def vector_search(queries: jax.Array, database: jax.Array, k: int, metric: str =
         
     return top_k_dists, top_k_indices
 
-@partial(jax.jit, static_argnames=['k', 'metric'])
+@partial(jax.jit, static_argnames=['mesh', 'k', 'metric'])
 def distributed_vector_search(mesh: Mesh, queries: jax.Array, database: jax.Array, k: int, metric: str = 'l2'):
     """
     Finds the top-K nearest neighbors using manual distributed SPMD compute.
@@ -211,7 +212,8 @@ def distributed_vector_search(mesh: Mesh, queries: jax.Array, database: jax.Arra
         # in_specs: Queries are copied entirely to all devices. Database is split along axis 0.
         in_specs=(P(None, None), P('data', None)),
         # out_specs: The gathered outputs from local_search are replicated across all devices.
-        out_specs=(P(None, None, None), P(None, None, None))
+        out_specs=(P(None, None, None), P(None, None, None)),
+        check_rep=False
     )(queries, database)
     
     # 5. Global Reduction (Absolute Top-K)
@@ -254,3 +256,89 @@ def distributed_vector_search(mesh: Mesh, queries: jax.Array, database: jax.Arra
         final_dists = global_top_k_scores
         
     return final_dists, final_indices
+
+@partial(jax.jit, static_argnames=['k', 'metric'])
+def static_vector_search(padded_queries: jax.Array, padded_db: jax.Array, db_mask: jax.Array, k: int, metric: str = 'l2'):
+    """
+    Finds the top-K nearest neighbors using a static shape, relying on masks to ignore padded data.
+    
+    Args:
+        padded_queries: Array of shape (MAX_B, D).
+        padded_db: Array of shape (MAX_N, D).
+        db_mask: Boolean array of shape (MAX_N,), where True indicates valid data.
+        k: The number of nearest neighbors to retrieve.
+        metric: The distance metric to use.
+    """
+    if metric == 'l2':
+        dists = l2_distance(padded_queries, padded_db)
+        scores = -dists
+    elif metric == 'cosine':
+        dists = cosine_distance(padded_queries, padded_db)
+        scores = -dists
+    elif metric == 'dot_product':
+        dists = dot_product_distance(padded_queries, padded_db)
+        scores = dists
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+        
+    # Apply masking
+    # jax.lax.top_k searches for the maximum value.
+    # By setting padded indices to -1e9, they will drop to the bottom and never be selected in top-k.
+    penalty = -1e9
+    masked_scores = jnp.where(db_mask[None, :], scores, penalty)
+    
+    top_k_scores, top_k_indices = jax.lax.top_k(masked_scores, k)
+    
+    if metric in ['l2', 'cosine']:
+        top_k_dists = -top_k_scores
+    else:
+        top_k_dists = top_k_scores
+        
+    return top_k_dists, top_k_indices
+
+class StaticVectorEngine:
+    """
+    A host-side wrapper that enforces strictly static tensor shapes for JAX.
+    It pads dynamic inputs with zeros up to the MAX bounds and creates boolean masks.
+    This guarantees the underlying JAX computation graph only ever compiles once.
+    """
+    def __init__(self, max_batch_size: int, max_db_size: int, dim: int, metric: str = 'l2'):
+        self.max_batch_size = max_batch_size
+        self.max_db_size = max_db_size
+        self.dim = dim
+        self.metric = metric
+        
+    def search(self, queries: np.ndarray, database: np.ndarray, k: int):
+        B, D = queries.shape
+        N, DB_D = database.shape
+        
+        if D != self.dim or DB_D != self.dim:
+            raise ValueError("Dimension mismatch")
+        if B > self.max_batch_size:
+            raise ValueError(f"Batch size {B} exceeds max_batch_size {self.max_batch_size}")
+        if N > self.max_db_size:
+            raise ValueError(f"Database size {N} exceeds max_db_size {self.max_db_size}")
+            
+        # 1. Pad queries
+        padded_queries = np.zeros((self.max_batch_size, self.dim), dtype=queries.dtype)
+        padded_queries[:B] = queries
+        
+        # 2. Pad database
+        padded_db = np.zeros((self.max_db_size, self.dim), dtype=database.dtype)
+        padded_db[:N] = database
+        
+        # 3. Create database mask
+        db_mask = np.zeros(self.max_db_size, dtype=bool)
+        db_mask[:N] = True
+        
+        # 4. Call jitted static function
+        # JAX will compile exactly one graph for shape (MAX_B, D) vs (MAX_N, D)
+        padded_dists, padded_indices = static_vector_search(
+            padded_queries, padded_db, db_mask, k, self.metric
+        )
+        
+        # 5. Unpad the results back to the original batch size
+        # We convert to NumPy arrays on the host before slicing. This avoids triggering
+        # JAX/XLA's dynamic slicing on the device, which would otherwise compile a new
+        # slice program for each dynamic query batch size B.
+        return np.array(padded_dists)[:B], np.array(padded_indices)[:B]

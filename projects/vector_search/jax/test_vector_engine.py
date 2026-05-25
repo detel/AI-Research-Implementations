@@ -162,3 +162,35 @@ def test_distributed_vector_search():
     # Assert exact match
     np.testing.assert_allclose(dist_dists, expected_dists, atol=1e-5)
     np.testing.assert_array_equal(dist_indices, expected_indices)
+
+def test_static_vector_engine():
+    from vector_engine import StaticVectorEngine
+    
+    # Initialize the static engine wrapper
+    max_b = 10
+    max_n = 20
+    dim = 4
+    k = 2
+    
+    engine = StaticVectorEngine(max_batch_size=max_b, max_db_size=max_n, dim=dim, metric='l2')
+    
+    # Generate dynamic data smaller than max bounds
+    B = 3
+    N = 5
+    
+    key = jax.random.PRNGKey(99)
+    db_key, query_key = jax.random.split(key)
+    
+    # Use numpy for the host-side inputs
+    queries = np.array(jax.random.normal(query_key, (B, dim)))
+    database = np.array(jax.random.normal(db_key, (N, dim)))
+    
+    # Run the unpadded baseline
+    expected_dists, expected_indices = vector_search(queries, database, k=k, metric='l2')
+    
+    # Run the padded engine
+    padded_dists, padded_indices = engine.search(queries, database, k=k)
+    
+    # Check that they match exactly, proving the padded zero-vectors didn't pollute the top-K
+    np.testing.assert_allclose(padded_dists, expected_dists, atol=1e-5)
+    np.testing.assert_array_equal(padded_indices, expected_indices)
